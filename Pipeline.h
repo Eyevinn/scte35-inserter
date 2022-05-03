@@ -13,8 +13,10 @@ public:
     explicit Pipeline(const std::pair<std::string, uint32_t>& inputAddress,
         const std::pair<std::string, uint32_t>& outputAddress,
         const std::chrono::milliseconds mpegTsBufferSize,
-        const std::chrono::minutes spliceInterval,
-        const std::chrono::minutes spliceDuration);
+        const std::chrono::seconds spliceInterval,
+        const std::chrono::seconds spliceDuration,
+        const bool immediate,
+        const std::string& outputFile);
 
     ~Pipeline();
 

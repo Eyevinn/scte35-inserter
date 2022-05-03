@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16.0)
-project(scte35-insert)
+project(scte35-inserter)
 
 set(CMAKE_CXX_STANDARD 17)
 

@@ -9,6 +9,17 @@
 #include <atomic>
 #include <gst/gst.h>
 #include <gst/mpegts/mpegts.h>
+#include <limits>
+
+namespace
+{
+
+constexpr uint64_t secondsToPts(const std::chrono::seconds value)
+{
+    return value.count() * 90000ULL;
+}
+
+} // namespace
 
 class Pipeline::Impl
 {
@@ -16,14 +27,17 @@ public:
     Impl(const std::pair<std::string, uint32_t>& inputAddress,
         const std::pair<std::string, uint32_t>& outputAddress,
         const std::chrono::milliseconds mpegTsBufferSize,
-        const std::chrono::minutes spliceInterval,
-        const std::chrono::minutes spliceDuration);
+        const std::chrono::seconds spliceInterval,
+        const std::chrono::seconds spliceDuration,
+        const bool immediate,
+        const std::string& outputFile);
     ~Impl();
 
     void run();
     void stop();
 
     void onPipelineMessage(GstMessage* message);
+    void linkDemuxPad(GstPad* newPad, GstElement* parser, GstElement* queue);
     void onDemuxPadAdded(GstPad* newPad);
 
     static gboolean pipelineBusWatch(GstBus* /*bus*/, GstMessage* message, gpointer userData);
@@ -39,12 +53,13 @@ private:
         TS_PARSE,
         TS_DEMUX,
         H264_PARSE,
+        MPEG2_PARSE,
         VIDEO_PARSE_QUEUE,
         AAC_PARSE,
         AUDIO_PARSE_QUEUE,
         TS_MUX,
         TS_MUX_QUEUE,
-        UDP_SINK
+        SINK
     };
 
     enum class SpliceType
@@ -53,24 +68,34 @@ private:
         OUT
     };
 
+    static const uint16_t scte35Pid = 35;
+    static constexpr auto splicePtsDelay = std::chrono::seconds(1);
+
     GstBus* pipelineMessageBus_;
     GstElement* pipeline_;
     std::map<ElementLabel, GstElement*> elements_;
-    std::chrono::minutes spliceInterval_;
-    std::chrono::minutes spliceDuration_;
+    std::chrono::seconds spliceInterval_;
+    std::chrono::seconds spliceDuration_;
+    bool immediate_;
+    uint64_t lastPts_;
 
     void makeElement(const ElementLabel elementLabel, const char* name, const char* element);
+    GstMpegtsSCTESIT* makeScteSit(const SpliceType spliceType);
     void sendScte35Splice(const SpliceType spliceType);
 };
 
 Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
     const std::pair<std::string, uint32_t>& outputAddress,
     const std::chrono::milliseconds mpegTsBufferSize,
-    const std::chrono::minutes spliceInterval,
-    const std::chrono::minutes spliceDuration)
+    const std::chrono::seconds spliceInterval,
+    const std::chrono::seconds spliceDuration,
+    const bool immediate,
+    const std::string& outputFile)
     : pipelineMessageBus_(nullptr),
       spliceInterval_(spliceInterval),
-      spliceDuration_(spliceDuration)
+      spliceDuration_(spliceDuration),
+      immediate_(immediate),
+      lastPts_(0)
 {
     gst_init(nullptr, nullptr);
 
@@ -80,12 +105,20 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
     makeElement(ElementLabel::TS_PARSE, "TS_PARSE", "tsparse");
     makeElement(ElementLabel::TS_DEMUX, "TS_DEMUX", "tsdemux");
     makeElement(ElementLabel::H264_PARSE, "H264_PARSE", "h264parse");
+    makeElement(ElementLabel::MPEG2_PARSE, "MPEG2_PARSE", "mpegvideoparse");
     makeElement(ElementLabel::VIDEO_PARSE_QUEUE, "VIDEO_PARSE_QUEUE", "queue");
     makeElement(ElementLabel::AAC_PARSE, "AAC_PARSE", "aacparse");
     makeElement(ElementLabel::AUDIO_PARSE_QUEUE, "AUDIO_PARSE_QUEUE", "queue");
     makeElement(ElementLabel::TS_MUX, "TS_MUX", "mpegtsmux");
     makeElement(ElementLabel::TS_MUX_QUEUE, "TS_MUX_QUEUE", "queue");
-    makeElement(ElementLabel::UDP_SINK, "UDP_SINK", "udpsink");
+    if (outputFile.empty())
+    {
+        makeElement(ElementLabel::SINK, "SINK", "udpsink");
+    }
+    else
+    {
+        makeElement(ElementLabel::SINK, "SINK", "filesink");
+    }
 
     for (const auto& entry : elements_)
     {
@@ -108,7 +141,7 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
 
     if (!gst_element_link_many(elements_[ElementLabel::TS_MUX],
             elements_[ElementLabel::TS_MUX_QUEUE],
-            elements_[ElementLabel::UDP_SINK],
+            elements_[ElementLabel::SINK],
             nullptr))
     {
         Logger::log("Elements could not be linked.");
@@ -118,6 +151,7 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
     pipelineMessageBus_ = gst_pipeline_get_bus(GST_PIPELINE(pipeline_));
     gst_bus_add_watch(pipelineMessageBus_, reinterpret_cast<GstBusFunc>(pipelineBusWatch), this);
 
+    g_object_set(elements_[ElementLabel::TS_DEMUX], "emit-stats", TRUE, nullptr);
     g_signal_connect(elements_[ElementLabel::TS_DEMUX], "pad-added", G_CALLBACK(demuxPadAddedCallback), this);
 
     g_object_set(elements_[ElementLabel::UDP_SOURCE],
@@ -128,7 +162,7 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
         "auto-multicast",
         true,
         "buffer-size",
-        825984,
+        212992,
         nullptr);
 
     g_object_set(elements_[ElementLabel::UDP_QUEUE],
@@ -136,17 +170,26 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
         std::chrono::nanoseconds(mpegTsBufferSize).count(),
         nullptr);
 
+    g_object_set(elements_[ElementLabel::TS_MUX], "scte-35-pid", scte35Pid, "scte-35-null-interval", 450000, nullptr);
+
     g_object_set(elements_[ElementLabel::TS_MUX_QUEUE],
         "min-threshold-time",
         std::chrono::nanoseconds(mpegTsBufferSize).count(),
         nullptr);
 
-    g_object_set(elements_[ElementLabel::UDP_SINK],
-        "host",
-        outputAddress.first.c_str(),
-        "port",
-        outputAddress.second,
-        nullptr);
+    if (outputFile.empty())
+    {
+        g_object_set(elements_[ElementLabel::SINK],
+            "host",
+            outputAddress.first.c_str(),
+            "port",
+            outputAddress.second,
+            nullptr);
+    }
+    else
+    {
+        g_object_set(elements_[ElementLabel::SINK], "location", outputFile.c_str(), nullptr);
+    }
 }
 
 Pipeline::Impl::~Impl()
@@ -168,6 +211,20 @@ Pipeline::Impl::~Impl()
     gst_deinit();
 }
 
+void Pipeline::Impl::linkDemuxPad(GstPad* newPad, GstElement* parser, GstElement* queue)
+{
+    utils::ScopedGLibObject parseSinkPad(gst_element_get_static_pad(parser, "sink"));
+    gst_pad_link(newPad, parseSinkPad.get());
+    gst_element_link(parser, queue);
+
+    utils::ScopedGLibObject parseQueueSourcePad(gst_element_get_static_pad(queue, "src"));
+
+    utils::ScopedGLibObject tsMuxSinkPad(
+        gst_element_get_compatible_pad(elements_[ElementLabel::TS_MUX], parseQueueSourcePad.get(), nullptr));
+
+    gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get());
+}
+
 void Pipeline::Impl::onDemuxPadAdded(GstPad* newPad)
 {
     utils::ScopedGstObject newPadCaps(gst_pad_get_current_caps(newPad));
@@ -178,14 +235,13 @@ void Pipeline::Impl::onDemuxPadAdded(GstPad* newPad)
 
     if (g_str_has_prefix(newPadType, "video/x-h264"))
     {
-        utils::ScopedGLibObject parseSinkPad(gst_element_get_static_pad(elements_[ElementLabel::H264_PARSE], "sink"));
-
-        if (gst_pad_link(newPad, parseSinkPad.get()) != GST_PAD_LINK_OK)
-        {
-            Logger::log("pad link 1");
-        }
-
-        gst_element_link(elements_[ElementLabel::H264_PARSE], elements_[ElementLabel::VIDEO_PARSE_QUEUE]);
+        linkDemuxPad(newPad, elements_[ElementLabel::H264_PARSE], elements_[ElementLabel::VIDEO_PARSE_QUEUE]);
+    }
+    else if (g_str_has_prefix(newPadType, "video/mpeg"))
+    {
+        utils::ScopedGLibObject parseSinkPad(gst_element_get_static_pad(elements_[ElementLabel::MPEG2_PARSE], "sink"));
+        gst_pad_link(newPad, parseSinkPad.get());
+        gst_element_link(elements_[ElementLabel::MPEG2_PARSE], elements_[ElementLabel::VIDEO_PARSE_QUEUE]);
 
         utils::ScopedGLibObject parseQueueSourcePad(
             gst_element_get_static_pad(elements_[ElementLabel::VIDEO_PARSE_QUEUE], "src"));
@@ -193,23 +249,12 @@ void Pipeline::Impl::onDemuxPadAdded(GstPad* newPad)
         utils::ScopedGLibObject tsMuxSinkPad(
             gst_element_get_compatible_pad(elements_[ElementLabel::TS_MUX], parseQueueSourcePad.get(), nullptr));
 
-        if (gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get()) != GST_PAD_LINK_OK)
-        {
-            Logger::log("pad link 2");
-        }
-    }
-    else if (g_str_has_prefix(newPadType, "video/mpeg"))
-    {
+        gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get());
     }
     else if (g_str_has_prefix(newPadType, "audio/mpeg"))
     {
         utils::ScopedGLibObject parseSinkPad(gst_element_get_static_pad(elements_[ElementLabel::AAC_PARSE], "sink"));
-
-        if (gst_pad_link(newPad, parseSinkPad.get()) != GST_PAD_LINK_OK)
-        {
-            Logger::log("pad link 1");
-        }
-
+        gst_pad_link(newPad, parseSinkPad.get());
         gst_element_link(elements_[ElementLabel::AAC_PARSE], elements_[ElementLabel::AUDIO_PARSE_QUEUE]);
 
         utils::ScopedGLibObject parseQueueSourcePad(
@@ -218,13 +263,7 @@ void Pipeline::Impl::onDemuxPadAdded(GstPad* newPad)
         utils::ScopedGLibObject tsMuxSinkPad(
             gst_element_get_compatible_pad(elements_[ElementLabel::TS_MUX], parseQueueSourcePad.get(), nullptr));
 
-        if (gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get()) != GST_PAD_LINK_OK)
-        {
-            Logger::log("pad link 2");
-        }
-    }
-    else if (g_str_has_prefix(newPadType, "audio/x-raw"))
-    {
+        gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get());
     }
     else
     {
@@ -257,12 +296,6 @@ void Pipeline::Impl::onPipelineMessage(GstMessage* message)
 
             if (newState == GST_STATE_PLAYING)
             {
-                int64_t position = -1;
-                if (!gst_element_query_position(elements_[ElementLabel::TS_PARSE], GST_FORMAT_TIME, &position))
-                {
-                    g_printerr("Could not query current position.\n");
-                }
-                Logger::log("Play started at position %" GST_TIME_FORMAT, GST_TIME_ARGS(position));
                 g_timeout_add_seconds(std::chrono::seconds(spliceInterval_).count(), sendScte35SpliceOutCallback, this);
             }
         }
@@ -283,6 +316,7 @@ void Pipeline::Impl::onPipelineMessage(GstMessage* message)
 
     case GST_MESSAGE_EOS:
         Logger::log("EOS received");
+        gst_element_set_state(pipeline_, GST_STATE_NULL);
         break;
 
     case GST_MESSAGE_NEW_CLOCK:
@@ -296,6 +330,23 @@ void Pipeline::Impl::onPipelineMessage(GstMessage* message)
         {
             Logger::log("Unable to restart the pipeline.");
             return;
+        }
+        break;
+
+    case GST_MESSAGE_ELEMENT:
+        if (GST_ELEMENT(message->src) == elements_[ElementLabel::TS_DEMUX])
+        {
+            const auto elementMessageStruct = gst_message_get_structure(message);
+            if (gst_structure_has_field(elementMessageStruct, "pts"))
+            {
+                int32_t pcrPid = -1;
+                g_object_get(elements_[ElementLabel::TS_PARSE], "pcr-pid", &pcrPid, nullptr);
+                const auto pid = g_value_get_uint(gst_structure_get_value(elementMessageStruct, "pid"));
+                if (pcrPid > 0 && pid == static_cast<uint32_t>(pcrPid))
+                {
+                    lastPts_ = g_value_get_uint64(gst_structure_get_value(elementMessageStruct, "pts"));
+                }
+            }
         }
         break;
 
@@ -321,33 +372,39 @@ void Pipeline::Impl::makeElement(const ElementLabel elementLabel, const char* na
     }
 }
 
+GstMpegtsSCTESIT* Pipeline::Impl::makeScteSit(const SpliceType spliceType)
+{
+    if (spliceType == SpliceType::IN)
+    {
+        return gst_mpegts_scte_splice_in_new(2, lastPts_ + secondsToPts(spliceDuration_ + splicePtsDelay));
+    }
+    else
+    {
+        const auto sliceAt =
+            immediate_ ? std::numeric_limits<uint64_t>::max() : lastPts_ + secondsToPts(splicePtsDelay);
+        return gst_mpegts_scte_splice_out_new(1, sliceAt, secondsToPts(spliceDuration_));
+    }
+}
+
 void Pipeline::Impl::sendScte35Splice(const Pipeline::Impl::SpliceType spliceType)
 {
-    int64_t position = -1;
-    if (!gst_element_query_position(elements_[ElementLabel::TS_PARSE], GST_FORMAT_TIME, &position))
-    {
-        g_printerr("Could not query current position.\n");
-    }
-    Logger::log("sendScte35Splice: %s %" GST_TIME_FORMAT,
+    Logger::log("SCTE-35 splice_insert: %s PTS %llu (%llu sec), immediate %c",
         spliceType == SpliceType::IN ? "IN" : "OUT",
-        GST_TIME_ARGS(position));
+        lastPts_ + secondsToPts(splicePtsDelay),
+        (lastPts_ + secondsToPts(splicePtsDelay)) / 90000ULL,
+        immediate_ ? 't' : 'f');
 
-    auto scteSit = spliceType == SpliceType::IN
-        ? gst_mpegts_scte_splice_in_new(2, std::chrono::seconds(spliceDuration_ + spliceInterval_).count() * 90000)
-        : gst_mpegts_scte_splice_out_new(1,
-              GST_TIME_AS_SECONDS(position) * 90000,
-              std::chrono::seconds(spliceDuration_).count() * 90000);
-
-    utils::ScopedGstObject mpegTsSection(gst_mpegts_section_from_scte_sit(scteSit, 123));
+    auto scteSit = makeScteSit(spliceType);
+    utils::ScopedGstObject mpegTsSection(gst_mpegts_section_from_scte_sit(scteSit, scte35Pid));
     gst_mpegts_section_send_event(mpegTsSection.get(), elements_[ElementLabel::TS_MUX]);
 
     if (spliceType == SpliceType::IN)
     {
-        g_timeout_add_seconds(std::chrono::seconds(spliceDuration_).count(), sendScte35SpliceOutCallback, this);
+        g_timeout_add_seconds(spliceInterval_.count(), sendScte35SpliceOutCallback, this);
     }
     else
     {
-        g_timeout_add_seconds(std::chrono::seconds(spliceInterval_).count(), sendScte35SpliceInCallback, this);
+        g_timeout_add_seconds(spliceDuration_.count(), sendScte35SpliceInCallback, this);
     }
 }
 
@@ -392,13 +449,17 @@ void Pipeline::Impl::stop() {}
 Pipeline::Pipeline(const std::pair<std::string, uint32_t>& inputAddress,
     const std::pair<std::string, uint32_t>& outputAddress,
     const std::chrono::milliseconds mpegTsBufferSize,
-    const std::chrono::minutes spliceInterval,
-    const std::chrono::minutes spliceDuration)
+    const std::chrono::seconds spliceInterval,
+    const std::chrono::seconds spliceDuration,
+    const bool immediate,
+    const std::string& outputFile)
     : impl_(std::make_unique<Pipeline::Impl>(inputAddress,
           outputAddress,
           mpegTsBufferSize,
           spliceInterval,
-          spliceDuration))
+          spliceDuration,
+          immediate,
+          outputFile))
 {
 }
 
