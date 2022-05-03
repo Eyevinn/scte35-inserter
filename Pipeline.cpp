@@ -239,31 +239,11 @@ void Pipeline::Impl::onDemuxPadAdded(GstPad* newPad)
     }
     else if (g_str_has_prefix(newPadType, "video/mpeg"))
     {
-        utils::ScopedGLibObject parseSinkPad(gst_element_get_static_pad(elements_[ElementLabel::MPEG2_PARSE], "sink"));
-        gst_pad_link(newPad, parseSinkPad.get());
-        gst_element_link(elements_[ElementLabel::MPEG2_PARSE], elements_[ElementLabel::VIDEO_PARSE_QUEUE]);
-
-        utils::ScopedGLibObject parseQueueSourcePad(
-            gst_element_get_static_pad(elements_[ElementLabel::VIDEO_PARSE_QUEUE], "src"));
-
-        utils::ScopedGLibObject tsMuxSinkPad(
-            gst_element_get_compatible_pad(elements_[ElementLabel::TS_MUX], parseQueueSourcePad.get(), nullptr));
-
-        gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get());
+        linkDemuxPad(newPad, elements_[ElementLabel::MPEG2_PARSE], elements_[ElementLabel::VIDEO_PARSE_QUEUE]);
     }
     else if (g_str_has_prefix(newPadType, "audio/mpeg"))
     {
-        utils::ScopedGLibObject parseSinkPad(gst_element_get_static_pad(elements_[ElementLabel::AAC_PARSE], "sink"));
-        gst_pad_link(newPad, parseSinkPad.get());
-        gst_element_link(elements_[ElementLabel::AAC_PARSE], elements_[ElementLabel::AUDIO_PARSE_QUEUE]);
-
-        utils::ScopedGLibObject parseQueueSourcePad(
-            gst_element_get_static_pad(elements_[ElementLabel::AUDIO_PARSE_QUEUE], "src"));
-
-        utils::ScopedGLibObject tsMuxSinkPad(
-            gst_element_get_compatible_pad(elements_[ElementLabel::TS_MUX], parseQueueSourcePad.get(), nullptr));
-
-        gst_pad_link(parseQueueSourcePad.get(), tsMuxSinkPad.get());
+        linkDemuxPad(newPad, elements_[ElementLabel::AAC_PARSE], elements_[ElementLabel::AUDIO_PARSE_QUEUE]);
     }
     else
     {
