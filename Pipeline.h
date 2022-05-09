@@ -16,6 +16,7 @@ public:
         const std::chrono::seconds spliceInterval,
         const std::chrono::seconds spliceDuration,
         const bool immediate,
+        const bool autoReturn,
         const std::string& outputFile);
 
     ~Pipeline();

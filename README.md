@@ -1,67 +1,21 @@
-# MPEG-TS SCTE-35 insert
+# MPEG-TS SCTE-35 inserter
 
-A tool for insert SCTE-35 splice in/out commands into an MPEG-TS stream for test purposes.
+A tool for inserting SCTE-35 splice in/out commands into an MPEG-TS stream for test purposes. Input is a unicast or multicast MPEG-TS stream. Output is a new MPEG-TS stream or a .ts file.
 
 ## Getting started
 
-Supported platforms are Ubuntu 21.10 and OSX.
+Requires gstreamer 1.20. Packaged and run as a docker container to simplify usage.
 
-### Ubuntu 21.10
-
-#### Install dependencies
-
-```
-apt-get install libgstreamer1.0-0 gstreamer1.0-plugins-bad gstreamer1.0-plugins-good cmake gcc g++ make gdb libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-bad1.0-dev
-```
-
-#### Build
-
-```
-cmake -DCMAKE_BUILD_TYPE=Release -G "Unix Makefiles" .
-make
-```
-
-#### Run
-```
-./scte35-inserter -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n <SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] --file [output file name (instead of UDP output)]
-```
-
-### OSX
-
-#### Requirements
-
-XCode command line tools installed.
-
-Install additional dependencies using homebrew:
-```
-brew install gstreamer gst-plugins-good gst-plugins-bad cmake
-```
-
-#### Build
-
-```
-cmake -DCMAKE_BUILD_TYPE=Release -G "Unix Makefiles" .
-make
-```
-
-#### Run
-```
-export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0/
-./scte35-inserter -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n <SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] --file [output file name (instead of UDP output)]
-```
-
-### Docker Container
-
-Build container (uses multi-stage builds):
+### Build container (uses multi-stage builds):
 
 ```
 docker build -t scte35-inserter:dev .
 ```
 
-Run container (example):
+### Usage
 
 ```
-docker run --rm scte35-inserter:dev -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n <SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] --file [output file name (instead of UDP output)]
+docker run --rm scte35-inserter:dev -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n <SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] [--autoreturn] --file [output file name (instead of UDP output)]
 ```
 
 ## License (Apache-2.0)

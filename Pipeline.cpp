@@ -11,16 +11,6 @@
 #include <gst/mpegts/mpegts.h>
 #include <limits>
 
-namespace
-{
-
-constexpr uint64_t secondsToPts(const std::chrono::seconds value)
-{
-    return value.count() * 90000ULL;
-}
-
-} // namespace
-
 class Pipeline::Impl
 {
 public:
@@ -30,6 +20,7 @@ public:
         const std::chrono::seconds spliceInterval,
         const std::chrono::seconds spliceDuration,
         const bool immediate,
+        const bool autoReturn,
         const std::string& outputFile);
     ~Impl();
 
@@ -69,7 +60,7 @@ private:
     };
 
     static const uint16_t scte35Pid = 35;
-    static constexpr auto splicePtsDelay = std::chrono::seconds(1);
+    static constexpr std::chrono::seconds splicePtsDelay = std::chrono::seconds(4);
 
     GstBus* pipelineMessageBus_;
     GstElement* pipeline_;
@@ -77,7 +68,9 @@ private:
     std::chrono::seconds spliceInterval_;
     std::chrono::seconds spliceDuration_;
     bool immediate_;
-    uint64_t lastPts_;
+    bool autoReturn_;
+    uint32_t nextEventId_;
+    uint16_t nextUid_;
 
     void makeElement(const ElementLabel elementLabel, const char* name, const char* element);
     GstMpegtsSCTESIT* makeScteSit(const SpliceType spliceType);
@@ -90,12 +83,15 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
     const std::chrono::seconds spliceInterval,
     const std::chrono::seconds spliceDuration,
     const bool immediate,
+    const bool autoReturn,
     const std::string& outputFile)
     : pipelineMessageBus_(nullptr),
       spliceInterval_(spliceInterval),
       spliceDuration_(spliceDuration),
       immediate_(immediate),
-      lastPts_(0)
+      autoReturn_(autoReturn),
+      nextEventId_(0),
+      nextUid_(0)
 {
     gst_init(nullptr, nullptr);
 
@@ -151,7 +147,6 @@ Pipeline::Impl::Impl(const std::pair<std::string, uint32_t>& inputAddress,
     pipelineMessageBus_ = gst_pipeline_get_bus(GST_PIPELINE(pipeline_));
     gst_bus_add_watch(pipelineMessageBus_, reinterpret_cast<GstBusFunc>(pipelineBusWatch), this);
 
-    g_object_set(elements_[ElementLabel::TS_DEMUX], "emit-stats", TRUE, nullptr);
     g_signal_connect(elements_[ElementLabel::TS_DEMUX], "pad-added", G_CALLBACK(demuxPadAddedCallback), this);
 
     g_object_set(elements_[ElementLabel::UDP_SOURCE],
@@ -313,23 +308,6 @@ void Pipeline::Impl::onPipelineMessage(GstMessage* message)
         }
         break;
 
-    case GST_MESSAGE_ELEMENT:
-        if (GST_ELEMENT(message->src) == elements_[ElementLabel::TS_DEMUX])
-        {
-            const auto elementMessageStruct = gst_message_get_structure(message);
-            if (gst_structure_has_field(elementMessageStruct, "pts"))
-            {
-                int32_t pcrPid = -1;
-                g_object_get(elements_[ElementLabel::TS_PARSE], "pcr-pid", &pcrPid, nullptr);
-                const auto pid = g_value_get_uint(gst_structure_get_value(elementMessageStruct, "pid"));
-                if (pcrPid > 0 && pid == static_cast<uint32_t>(pcrPid))
-                {
-                    lastPts_ = g_value_get_uint64(gst_structure_get_value(elementMessageStruct, "pts"));
-                }
-            }
-        }
-        break;
-
     default:
         break;
     }
@@ -354,33 +332,54 @@ void Pipeline::Impl::makeElement(const ElementLabel elementLabel, const char* na
 
 GstMpegtsSCTESIT* Pipeline::Impl::makeScteSit(const SpliceType spliceType)
 {
+    int64_t position = -1;
+    gst_element_query_position(elements_[ElementLabel::TS_DEMUX], GST_FORMAT_TIME, &position);
+    const auto eventTime =
+        std::chrono::nanoseconds(GST_TIME_AS_NSECONDS(position)) + std::chrono::nanoseconds(splicePtsDelay);
+
+    Logger::log("SCTE-35 splice_insert: %s %llu ns (%llu) s, immediate %c, duration %llu s",
+        spliceType == SpliceType::IN ? "IN" : "OUT",
+        eventTime.count(),
+        std::chrono::duration_cast<std::chrono::seconds>(eventTime).count(),
+        immediate_ ? 't' : 'f',
+        spliceDuration_);
+
     if (spliceType == SpliceType::IN)
     {
-        return gst_mpegts_scte_splice_in_new(2, lastPts_ + secondsToPts(spliceDuration_ + splicePtsDelay));
+        auto result = gst_mpegts_scte_splice_in_new(nextEventId_, eventTime.count());
+        ++nextEventId_;
+        ++nextUid_;
+        return result;
     }
     else
     {
-        const auto sliceAt =
-            immediate_ ? std::numeric_limits<uint64_t>::max() : lastPts_ + secondsToPts(splicePtsDelay);
-        return gst_mpegts_scte_splice_out_new(1, sliceAt, secondsToPts(spliceDuration_));
+        const auto spliceTime = immediate_ ? std::numeric_limits<uint64_t>::max() : eventTime.count();
+        auto result =
+            gst_mpegts_scte_splice_out_new(nextEventId_, spliceTime, std::chrono::nanoseconds(spliceDuration_).count());
+        for (size_t i = 0; i < result->splices->len; ++i)
+        {
+            auto event = reinterpret_cast<GstMpegtsSCTESpliceEvent*>(result->splices->pdata[i]);
+            event->unique_program_id = nextUid_;
+            if (autoReturn_)
+            {
+                event->break_duration_auto_return = TRUE;
+            }
+        }
+        ++nextEventId_;
+        return result;
     }
 }
 
 void Pipeline::Impl::sendScte35Splice(const Pipeline::Impl::SpliceType spliceType)
 {
-    Logger::log("SCTE-35 splice_insert: %s PTS %llu (%llu sec), immediate %c",
-        spliceType == SpliceType::IN ? "IN" : "OUT",
-        lastPts_ + secondsToPts(splicePtsDelay),
-        (lastPts_ + secondsToPts(splicePtsDelay)) / 90000ULL,
-        immediate_ ? 't' : 'f');
-
     auto scteSit = makeScteSit(spliceType);
     utils::ScopedGstObject mpegTsSection(gst_mpegts_section_from_scte_sit(scteSit, scte35Pid));
     gst_mpegts_section_send_event(mpegTsSection.get(), elements_[ElementLabel::TS_MUX]);
 
-    if (spliceType == SpliceType::IN)
+    if (spliceType == SpliceType::IN || autoReturn_)
     {
-        g_timeout_add_seconds(spliceInterval_.count(), sendScte35SpliceOutCallback, this);
+        const auto delay = autoReturn_ ? spliceInterval_ + spliceDuration_ : spliceInterval_;
+        g_timeout_add_seconds(delay.count(), sendScte35SpliceOutCallback, this);
     }
     else
     {
@@ -432,6 +431,7 @@ Pipeline::Pipeline(const std::pair<std::string, uint32_t>& inputAddress,
     const std::chrono::seconds spliceInterval,
     const std::chrono::seconds spliceDuration,
     const bool immediate,
+    const bool autoReturn,
     const std::string& outputFile)
     : impl_(std::make_unique<Pipeline::Impl>(inputAddress,
           outputAddress,
@@ -439,6 +439,7 @@ Pipeline::Pipeline(const std::pair<std::string, uint32_t>& inputAddress,
           spliceInterval,
           spliceDuration,
           immediate,
+          autoReturn,
           outputFile))
 {
 }

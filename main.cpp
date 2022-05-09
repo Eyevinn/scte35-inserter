@@ -11,9 +11,10 @@
 namespace
 {
 
-const char* usageString = "Usage: scte35-inserter -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n "
-                          "<SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] --file [output "
-                          "file name (instead of UDP output)]";
+const char* usageString =
+    "Usage: scte35-inserter -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n "
+    "<SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] [--autoreturn] --file [output "
+    "file name (instead of UDP output)]";
 
 GMainLoop* mainLoop = nullptr;
 std::unique_ptr<Pipeline> pipeline;
@@ -59,15 +60,17 @@ int32_t main(int32_t argc, char** argv)
     std::string outputFileName;
 
     int32_t immediate = 0;
+    int32_t autoReturn = 0;
 
-    std::array<option, 7> longOptions;
+    std::array<option, 8> longOptions;
     longOptions[0] = {"file", required_argument, 0, 'f'};
     longOptions[1] = {"immediate", no_argument, &immediate, 1};
     longOptions[2] = {"input", required_argument, 0, 'i'};
     longOptions[3] = {"output", required_argument, 0, 'o'};
     longOptions[4] = {"interval", required_argument, 0, 'n'};
     longOptions[5] = {"duration", required_argument, 0, 'd'};
-    longOptions[6] = {0, 0, 0, 0};
+    longOptions[6] = {"autoreturn", no_argument, &autoReturn, 1};
+    longOptions[7] = {0, 0, 0, 0};
 
     int32_t optionIndex = 0;
 
@@ -116,6 +119,7 @@ int32_t main(int32_t argc, char** argv)
         spliceInterval,
         spliceDuration,
         immediate == 1,
+        autoReturn == 1,
         outputFileName);
     pipeline->run();
 
