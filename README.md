@@ -18,6 +18,10 @@ docker build -t scte35-inserter:dev .
 docker run --rm scte35-inserter:dev -i <MPEG-TS input address:port> -o [MPEG-TS output address:port] -n <SCTE-35 splice interval s> -d <SCTE-35 splice duration s> [--immediate] [--autoreturn] --file [output file name (instead of UDP output)]
 ```
 
+### Building without docker
+
+Builds on Linux and OSX, requires gstreamer 1.20, gstreamer-plugins-bad 1.20 and cmake.
+
 ## License (Apache-2.0)
 
 ```
