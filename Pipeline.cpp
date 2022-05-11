@@ -347,6 +347,11 @@ GstMpegtsSCTESIT* Pipeline::Impl::makeScteSit(const SpliceType spliceType)
     if (spliceType == SpliceType::IN)
     {
         auto result = gst_mpegts_scte_splice_in_new(nextEventId_, eventTime.count());
+        for (size_t i = 0; i < result->splices->len; ++i)
+        {
+            auto event = reinterpret_cast<GstMpegtsSCTESpliceEvent*>(result->splices->pdata[i]);
+            event->unique_program_id = nextUid_;
+        }
         ++nextEventId_;
         ++nextUid_;
         return result;
